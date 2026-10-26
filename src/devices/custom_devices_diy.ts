@@ -2,6 +2,7 @@ import {Zcl} from "zigbee-herdsman";
 
 import * as fz from "../converters/fromZigbee";
 import * as tz from "../converters/toZigbee";
+import type {ThermostatFanMode, ThermostatSystemMode} from "../lib/constants";
 import * as constants from "../lib/constants";
 import * as exposes from "../lib/exposes";
 import * as legacy from "../lib/legacy";
@@ -1346,6 +1347,129 @@ interface RamsesTxCluster {
     commands: {nativeMode: {enabled: boolean}};
     commandResponses: never;
 }
+
+interface HisenseAc {
+    attributes: {
+        fanSpeed: number;
+        turbo: number;
+        economy: number;
+        sleep: number;
+        vswing: number;
+        hswing: number;
+        display: number;
+        resend: number;
+        heatSetpoint: number;
+        coolSetpoint: number;
+    };
+    commands: never;
+    commandResponses: never;
+}
+
+const hisenseAcSystemModes: {[key: string]: number} = {off: 0x00, cool: 0x03, heat: 0x04, fan_only: 0x07, dry: 0x08};
+const hisenseAcFanSpeeds: {[key: string]: number} = {auto: 0, low: 1, mid_low: 2, medium: 3, mid_high: 4, high: 5};
+const hisenseAcTempMin = 16;
+const hisenseAcTempMax = 30;
+const hisenseAcInvalidTemp = -32768;
+
+const hisenseAcClamp = (value: unknown) => Math.min(hisenseAcTempMax, Math.max(hisenseAcTempMin, Math.round(Number(value))));
+const hisenseAcUsesHeatingSetpoint = (mode: unknown) => mode === "heat" || mode === "off" || mode === undefined;
+const hisenseAcActiveSetpoint = (state: KeyValue) =>
+    hisenseAcUsesHeatingSetpoint(state.system_mode) ? state.occupied_heating_setpoint : state.occupied_cooling_setpoint;
+
+const fzHisenseAc = {
+    thermostat: {
+        cluster: "hvacThermostat",
+        type: ["attributeReport", "readResponse"],
+        convert: (model, msg, publish, options, meta) => {
+            const data = msg.data;
+            const result: KeyValue = {};
+            if (data.systemMode !== undefined) {
+                const mode = getKey(hisenseAcSystemModes, data.systemMode);
+                if (mode !== undefined) result.system_mode = mode;
+            }
+            if (data.occupiedHeatingSetpoint !== undefined) result.occupied_heating_setpoint = data.occupiedHeatingSetpoint / 100;
+            if (data.occupiedCoolingSetpoint !== undefined) result.occupied_cooling_setpoint = data.occupiedCoolingSetpoint / 100;
+            if (data.localTemp !== undefined && data.localTemp !== hisenseAcInvalidTemp) result.local_temperature = data.localTemp / 100;
+            if (
+                result.system_mode !== undefined ||
+                result.occupied_heating_setpoint !== undefined ||
+                result.occupied_cooling_setpoint !== undefined
+            ) {
+                const setpoint = hisenseAcActiveSetpoint({...meta.state, ...result});
+                if (setpoint !== undefined) result.current_heating_setpoint = setpoint;
+            }
+            return result;
+        },
+    } satisfies Fz.Converter<"hvacThermostat", undefined, ["attributeReport", "readResponse"]>,
+    fan_speed: {
+        cluster: "hisenseAc",
+        type: ["attributeReport", "readResponse"],
+        convert: (model, msg, publish, options, meta) => {
+            if (msg.data.fanSpeed === undefined) return;
+            const speed = getKey(hisenseAcFanSpeeds, msg.data.fanSpeed);
+            return speed === undefined ? undefined : {fan_mode: speed};
+        },
+    } satisfies Fz.Converter<"hisenseAc", HisenseAc, ["attributeReport", "readResponse"]>,
+};
+
+const tzHisenseAc = {
+    system_mode: {
+        key: ["system_mode"],
+        convertSet: async (entity, key, value, meta) => {
+            const zcl = hisenseAcSystemModes[value as string];
+            if (zcl === undefined) throw new Error(`Unsupported system_mode '${value}'`);
+            await entity.write("hvacThermostat", {systemMode: zcl});
+            const state: KeyValue = {system_mode: value};
+            const setpoint = hisenseAcActiveSetpoint({...meta.state, ...state});
+            if (setpoint !== undefined) state.current_heating_setpoint = setpoint;
+            return {state};
+        },
+        convertGet: async (entity, key, meta) => {
+            await entity.read("hvacThermostat", ["systemMode", "occupiedHeatingSetpoint", "occupiedCoolingSetpoint"]);
+        },
+    } satisfies Tz.Converter,
+    setpoints: {
+        key: ["current_heating_setpoint", "occupied_heating_setpoint", "occupied_cooling_setpoint"],
+        convertSet: async (entity, key, value, meta) => {
+            const temp = hisenseAcClamp(value);
+            const heating =
+                key === "occupied_heating_setpoint" ||
+                (key === "current_heating_setpoint" && hisenseAcUsesHeatingSetpoint(meta.message.system_mode ?? meta.state.system_mode));
+            await entity.write<"hisenseAc", HisenseAc>("hisenseAc", heating ? {heatSetpoint: temp * 100} : {coolSetpoint: temp * 100});
+            const state: KeyValue = heating ? {occupied_heating_setpoint: temp} : {occupied_cooling_setpoint: temp};
+            const setpoint = hisenseAcActiveSetpoint({...meta.state, ...state});
+            if (setpoint !== undefined) state.current_heating_setpoint = setpoint;
+            return {state};
+        },
+        convertGet: async (entity, key, meta) => {
+            await entity.read("hvacThermostat", ["occupiedHeatingSetpoint", "occupiedCoolingSetpoint"]);
+        },
+    } satisfies Tz.Converter,
+    fan_mode: {
+        key: ["fan_mode"],
+        convertSet: async (entity, key, value, meta) => {
+            const speed = hisenseAcFanSpeeds[value as string];
+            if (speed === undefined) throw new Error(`Unsupported fan_mode '${value}'`);
+            await entity.write<"hisenseAc", HisenseAc>("hisenseAc", {fanSpeed: speed});
+            return {state: {fan_mode: value}};
+        },
+        convertGet: async (entity, key, meta) => {
+            await entity.read<"hisenseAc", HisenseAc>("hisenseAc", ["fanSpeed"]);
+        },
+    } satisfies Tz.Converter,
+};
+
+const hisenseAcToggle = (name: "turbo" | "economy" | "sleep" | "vswing" | "hswing" | "display", description: string): ModernExtend =>
+    m.binary<"hisenseAc", HisenseAc>({
+        name,
+        cluster: "hisenseAc",
+        attribute: name,
+        valueOn: ["ON", 1],
+        valueOff: ["OFF", 0],
+        description,
+        access: "ALL",
+        reporting: {min: 0, max: 3600, change: 0},
+    });
 
 export const definitions: DefinitionWithExtend[] = [
     /**
@@ -2697,5 +2821,97 @@ export const definitions: DefinitionWithExtend[] = [
             }),
             m.identify(),
         ],
+    },
+    {
+        zigbeeModel: ["hisense-ir-ac"],
+        model: "hisense-ir-ac",
+        vendor: "Custom devices (DiY)",
+        description: "Hisense heat pump IR bridge (ESP32-C6, KELON168)",
+        fromZigbee: [fzHisenseAc.thermostat, fzHisenseAc.fan_speed],
+        toZigbee: [tzHisenseAc.system_mode, tzHisenseAc.setpoints, tzHisenseAc.fan_mode],
+        exposes: [
+            e
+                .climate()
+                .withSystemMode(Object.keys(hisenseAcSystemModes) as ThermostatSystemMode[])
+                .withSetpoint("current_heating_setpoint", hisenseAcTempMin, hisenseAcTempMax, 1)
+                .withLocalTemperature(ea.STATE)
+                // mid_low and mid_high are not in ThermostatFanMode, but the device has six speeds.
+                .withFanMode(Object.keys(hisenseAcFanSpeeds) as ThermostatFanMode[]),
+            e
+                .numeric("occupied_heating_setpoint", ea.ALL)
+                .withUnit("°C")
+                .withValueMin(hisenseAcTempMin)
+                .withValueMax(hisenseAcTempMax)
+                .withValueStep(1)
+                .withDescription("Heating setpoint (used in heat mode)"),
+            e
+                .numeric("occupied_cooling_setpoint", ea.ALL)
+                .withUnit("°C")
+                .withValueMin(hisenseAcTempMin)
+                .withValueMax(hisenseAcTempMax)
+                .withValueStep(1)
+                .withDescription("Cooling setpoint (used in cool, dry and fan modes)"),
+        ],
+        extend: [
+            // Setpoints are written to this cluster (0x0020, 0x0021) because the stack rejects
+            // hvacThermostat writes when the cooling setpoint is below the heating setpoint.
+            m.deviceAddCustomCluster("hisenseAc", {
+                name: "hisenseAc",
+                ID: 0xfc20,
+                attributes: {
+                    fanSpeed: {name: "fanSpeed", ID: 0x0000, type: Zcl.DataType.ENUM8, write: true},
+                    turbo: {name: "turbo", ID: 0x0001, type: Zcl.DataType.BOOLEAN, write: true},
+                    economy: {name: "economy", ID: 0x0002, type: Zcl.DataType.BOOLEAN, write: true},
+                    sleep: {name: "sleep", ID: 0x0003, type: Zcl.DataType.BOOLEAN, write: true},
+                    vswing: {name: "vswing", ID: 0x0004, type: Zcl.DataType.BOOLEAN, write: true},
+                    hswing: {name: "hswing", ID: 0x0005, type: Zcl.DataType.BOOLEAN, write: true},
+                    display: {name: "display", ID: 0x0006, type: Zcl.DataType.BOOLEAN, write: true},
+                    resend: {name: "resend", ID: 0x0010, type: Zcl.DataType.ENUM8, write: true},
+                    heatSetpoint: {name: "heatSetpoint", ID: 0x0020, type: Zcl.DataType.INT16, write: true},
+                    coolSetpoint: {name: "coolSetpoint", ID: 0x0021, type: Zcl.DataType.INT16, write: true},
+                },
+                commands: {},
+                commandsResponse: {},
+            }),
+            hisenseAcToggle("turbo", "Turbo. In heat mode the unit also sets 30 °C; off restores the old setpoint."),
+            hisenseAcToggle("economy", "Economy. Forces fan low; off restores the old fan speed."),
+            hisenseAcToggle("sleep", "Sleep. Forces fan low; off restores the old fan speed."),
+            hisenseAcToggle("vswing", "Vertical swing (IR toggle, state tracked by the bridge)"),
+            hisenseAcToggle("hswing", "Horizontal swing (IR toggle, state tracked by the bridge)"),
+            hisenseAcToggle("display", "Unit display (IR toggle, state tracked by the bridge)"),
+            m.enumLookup<"hisenseAc", HisenseAc>({
+                name: "resend",
+                cluster: "hisenseAc",
+                attribute: "resend",
+                lookup: {state: 1, vswing_pulse: 2, hswing_pulse: 3, display_pulse: 4},
+                description:
+                    "state: send the full state again. *_pulse: send one toggle frame without changing the tracked state " +
+                    "(use it when the unit and Home Assistant disagree).",
+                access: "SET",
+                reporting: false,
+                entityCategory: "config",
+            }),
+        ],
+        configure: async (device, coordinatorEndpoint) => {
+            const endpoint = device.getEndpoint(1);
+            await endpoint.bind("hvacThermostat", coordinatorEndpoint);
+            await endpoint.bind("hisenseAc", coordinatorEndpoint);
+            const reportCfg = (attribute: "systemMode" | "occupiedHeatingSetpoint" | "occupiedCoolingSetpoint") => ({
+                attribute,
+                minimumReportInterval: 0,
+                maximumReportInterval: 3600,
+                reportableChange: 0,
+            });
+            await endpoint.configureReporting("hvacThermostat", [
+                reportCfg("systemMode"),
+                reportCfg("occupiedHeatingSetpoint"),
+                reportCfg("occupiedCoolingSetpoint"),
+            ]);
+            await endpoint.configureReporting("hisenseAc", [
+                {attribute: {ID: 0x0000, type: Zcl.DataType.ENUM8}, minimumReportInterval: 0, maximumReportInterval: 3600, reportableChange: 0},
+            ]);
+            await endpoint.read("hvacThermostat", ["systemMode", "occupiedHeatingSetpoint", "occupiedCoolingSetpoint"]);
+            await endpoint.read("hisenseAc", [0x0000, 0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006]);
+        },
     },
 ];
